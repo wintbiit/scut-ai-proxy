@@ -1,0 +1,6 @@
+target
+.git
+.gitea
+.env
+*.log
+Dockerfile
