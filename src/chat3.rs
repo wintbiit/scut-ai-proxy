@@ -41,6 +41,7 @@ impl Chat3Client {
         mut request: ChatCompletionRequest,
     ) -> Result<BoxStream<'static, Result<Bytes, reqwest::Error>>, Chat3Error> {
         request.stream = true;
+        normalize_tool_messages_for_upstream(&mut request);
         let response = self
             .http
             .post(format!("{}/chat/completions", self.base_url))
@@ -110,6 +111,60 @@ impl Chat3Client {
             created,
             raw_content,
         })
+    }
+}
+
+fn normalize_tool_messages_for_upstream(request: &mut ChatCompletionRequest) {
+    for message in &mut request.messages {
+        match message.role.as_str() {
+            "tool" => {
+                let name = message
+                    .name
+                    .as_deref()
+                    .or(message.tool_call_id.as_deref())
+                    .unwrap_or("tool");
+                let content = message
+                    .content
+                    .as_ref()
+                    .map(stringify_message_content)
+                    .unwrap_or_default();
+                message.role = "user".to_string();
+                message.content = Some(Value::String(format!(
+                    "Tool result from {name}:\n{content}"
+                )));
+                message.name = None;
+                message.tool_call_id = None;
+                message.tool_calls = None;
+            }
+            "assistant" => {
+                if let Some(tool_calls) = message.tool_calls.take() {
+                    let existing = message
+                        .content
+                        .as_ref()
+                        .map(stringify_message_content)
+                        .unwrap_or_default();
+                    let calls = tool_calls
+                        .iter()
+                        .map(|call| format!("{}({})", call.function.name, call.function.arguments))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let content = if existing.trim().is_empty() {
+                        format!("Tool calls requested:\n{calls}")
+                    } else {
+                        format!("{existing}\n\nTool calls requested:\n{calls}")
+                    };
+                    message.content = Some(Value::String(content));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn stringify_message_content(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -232,5 +287,80 @@ pub fn completion_response(
             },
             finish_reason: "stop".to_string(),
         }],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openai::{ChatMessage, ResponseToolCall, ResponseToolCallFunction};
+
+    #[test]
+    fn converts_tool_role_messages_to_user_text_for_chat3() {
+        let mut request = ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage {
+                role: "tool".to_string(),
+                content: Some(Value::String("{\"ok\":true}".to_string())),
+                name: Some("query_prometheus".to_string()),
+                tool_call_id: Some("call_1".to_string()),
+                tool_calls: None,
+            }],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        normalize_tool_messages_for_upstream(&mut request);
+
+        assert_eq!(request.messages[0].role, "user");
+        assert_eq!(request.messages[0].name, None);
+        assert_eq!(request.messages[0].tool_call_id, None);
+        assert!(
+            request.messages[0]
+                .content
+                .as_ref()
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("Tool result from query_prometheus")
+        );
+    }
+
+    #[test]
+    fn converts_assistant_tool_calls_to_text_for_chat3() {
+        let mut request = ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ResponseToolCall {
+                    id: "call_1".to_string(),
+                    kind: "function".to_string(),
+                    function: ResponseToolCallFunction {
+                        name: "nodes_top".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+            }],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        normalize_tool_messages_for_upstream(&mut request);
+
+        assert!(request.messages[0].tool_calls.is_none());
+        assert_eq!(
+            request.messages[0].content.as_ref().and_then(Value::as_str),
+            Some("Tool calls requested:\nnodes_top({})")
+        );
     }
 }
