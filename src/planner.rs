@@ -3,7 +3,7 @@ use crate::openai::{
     ToolChoice,
 };
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -450,6 +450,169 @@ pub fn response_tool_calls(decision: PlannerDecision) -> Option<Vec<ResponseTool
     }
 }
 
+pub fn fallback_decision(
+    request: &ChatCompletionRequest,
+    tools: &[Tool],
+) -> Option<PlannerDecision> {
+    required_tool_decision(request, tools).or_else(|| {
+        let query = last_user_text(request)?;
+        let normalized = query.to_lowercase();
+        best_no_required_tool(&normalized, tools).map(|name| tool_call(name, Map::new()))
+    })
+}
+
+pub fn required_tool_decision(
+    request: &ChatCompletionRequest,
+    tools: &[Tool],
+) -> Option<PlannerDecision> {
+    let query = last_user_text(request)?;
+    let normalized = query.to_lowercase();
+
+    if contains_any(&normalized, &["cpu", "内存", "memory", "节点", "node"]) {
+        if has_tool(tools, "nodes_top") {
+            return Some(tool_call("nodes_top", Map::new()));
+        }
+    }
+
+    if contains_any(
+        &normalized,
+        &["通不通", "连通", "可达", "http", "https", "域名", "证书"],
+    ) {
+        if has_tool(tools, "query_prometheus") {
+            let mut args = Map::new();
+            let target = extract_url_or_domain(&query);
+            let expr = target
+                .map(|target| format!("probe_success{{instance=\"{target}\"}}"))
+                .unwrap_or_else(|| "probe_success".to_string());
+            args.insert("expr".to_string(), Value::String(expr));
+            return Some(tool_call("query_prometheus", args));
+        }
+    }
+
+    if contains_any(&normalized, &["部署", "deployment", "deploy"])
+        && has_tool(tools, "resources_list")
+    {
+        let mut args = Map::new();
+        args.insert(
+            "apiVersion".to_string(),
+            Value::String("apps/v1".to_string()),
+        );
+        args.insert("kind".to_string(), Value::String("Deployment".to_string()));
+        return Some(tool_call("resources_list", args));
+    }
+
+    if contains_any(&normalized, &["服务", "service", "svc"]) && has_tool(tools, "resources_list")
+    {
+        let mut args = Map::new();
+        args.insert("apiVersion".to_string(), Value::String("v1".to_string()));
+        args.insert("kind".to_string(), Value::String("Service".to_string()));
+        return Some(tool_call("resources_list", args));
+    }
+
+    None
+}
+
+fn last_user_text(request: &ChatCompletionRequest) -> Option<String> {
+    request.messages.iter().rev().find_map(|message| {
+        if message.role != "user" {
+            return None;
+        }
+        let content = message.content.as_ref()?;
+        match content {
+            Value::String(text) => Some(text.clone()),
+            Value::Array(parts) => {
+                let text = parts
+                    .iter()
+                    .filter_map(|part| {
+                        part.get("text")
+                            .or_else(|| part.get("content"))
+                            .and_then(Value::as_str)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!text.is_empty()).then_some(text)
+            }
+            other => Some(other.to_string()),
+        }
+    })
+}
+
+fn contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn has_tool(tools: &[Tool], name: &str) -> bool {
+    tools.iter().any(|tool| tool.function.name == name)
+}
+
+fn tool_call(name: impl Into<String>, arguments: Map<String, Value>) -> PlannerDecision {
+    PlannerDecision::ToolCalls {
+        calls: vec![PlannerCall {
+            name: name.into(),
+            arguments: Value::Object(arguments),
+        }],
+    }
+}
+
+fn best_no_required_tool(query: &str, tools: &[Tool]) -> Option<String> {
+    tools
+        .iter()
+        .filter(|tool| {
+            tool.function
+                .parameters
+                .get("required")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+        })
+        .max_by_key(|tool| {
+            let haystack = format!(
+                "{} {}",
+                tool.function.name.to_lowercase(),
+                tool.function
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase()
+            );
+            query
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|token| token.len() >= 3 && haystack.contains(token))
+                .count()
+        })
+        .filter(|tool| {
+            let haystack = format!(
+                "{} {}",
+                tool.function.name.to_lowercase(),
+                tool.function
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase()
+            );
+            query
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|token| token.len() >= 3 && haystack.contains(token))
+        })
+        .map(|tool| tool.function.name.clone())
+}
+
+fn extract_url_or_domain(text: &str) -> Option<String> {
+    let token = text
+        .split_whitespace()
+        .find(|token| token.contains('.') && !token.contains('{') && !token.contains('}'))?
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                ',' | '，' | '.' | '。' | '?' | '？' | ':' | '：' | ';' | '；' | '"' | '\''
+            )
+        });
+    if token.starts_with("http://") || token.starts_with("https://") {
+        Some(token.to_string())
+    } else {
+        Some(format!("https://{token}"))
+    }
+}
+
 #[cfg(test)]
 fn tool_schema(name: &str) -> Tool {
     Tool {
@@ -469,8 +632,42 @@ fn tool_schema(name: &str) -> Tool {
 }
 
 #[cfg(test)]
+fn no_required_tool_schema(name: &str) -> Tool {
+    Tool {
+        kind: "function".to_string(),
+        function: crate::openai::ToolFunction {
+            name: name.to_string(),
+            description: None,
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request_with_user_text(text: &str, tools: Vec<Tool>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::String(text.to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            tools: Some(tools),
+            tool_choice: Some(ToolChoice::String("auto".to_string())),
+        }
+    }
 
     #[test]
     fn validates_tool_call() {
@@ -588,5 +785,86 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(decision, PlannerDecision::ToolCalls { .. }));
+    }
+
+    #[test]
+    fn fallback_selects_nodes_top_for_cpu_query() {
+        let tools = vec![no_required_tool_schema("nodes_top")];
+        let request = request_with_user_text("帮我看看集群 CPU 和内存状态", tools.clone());
+        let decision = fallback_decision(&request, &tools).unwrap();
+        match decision {
+            PlannerDecision::ToolCalls { calls } => {
+                assert_eq!(calls[0].name, "nodes_top");
+                assert_eq!(calls[0].arguments, serde_json::json!({}));
+            }
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn fallback_selects_deployments_resource_list() {
+        let tools = vec![Tool {
+            kind: "function".to_string(),
+            function: crate::openai::ToolFunction {
+                name: "resources_list".to_string(),
+                description: None,
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "apiVersion": {"type": "string"},
+                        "kind": {"type": "string"}
+                    },
+                    "required": ["apiVersion", "kind"]
+                }),
+            },
+        }];
+        let request = request_with_user_text("列一下现在的 deployment", tools.clone());
+        let decision = fallback_decision(&request, &tools).unwrap();
+        match decision {
+            PlannerDecision::ToolCalls { calls } => {
+                assert_eq!(calls[0].name, "resources_list");
+                assert_eq!(calls[0].arguments["apiVersion"], "apps/v1");
+                assert_eq!(calls[0].arguments["kind"], "Deployment");
+            }
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn fallback_selects_prometheus_probe_for_domain_query() {
+        let tools = vec![Tool {
+            kind: "function".to_string(),
+            function: crate::openai::ToolFunction {
+                name: "query_prometheus".to_string(),
+                description: None,
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "expr": {"type": "string"}
+                    },
+                    "required": ["expr"]
+                }),
+            },
+        }];
+        let request = request_with_user_text("帮我看 s3.scutbot.cn 通不通", tools.clone());
+        let decision = fallback_decision(&request, &tools).unwrap();
+        match decision {
+            PlannerDecision::ToolCalls { calls } => {
+                assert_eq!(calls[0].name, "query_prometheus");
+                assert_eq!(
+                    calls[0].arguments["expr"],
+                    "probe_success{instance=\"https://s3.scutbot.cn\"}"
+                );
+            }
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn required_tool_decision_does_not_guess_generic_tools() {
+        let tools = vec![no_required_tool_schema("nodes_top")];
+        let request = request_with_user_text("你好，介绍一下你自己", tools.clone());
+        assert!(required_tool_decision(&request, &tools).is_none());
+        assert!(fallback_decision(&request, &tools).is_none());
     }
 }

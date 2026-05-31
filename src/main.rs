@@ -218,6 +218,20 @@ async fn plan_tool_calls(
         let raw = reasoning::clean_reasoning(&collected.raw_content);
         match planner::parse_and_validate(&raw, &tools, &request.tool_choice) {
             Ok(decision) => {
+                if matches!(decision, planner::PlannerDecision::Final { .. }) {
+                    if let Some(required_decision) =
+                        planner::required_tool_decision(&request, &tools)
+                    {
+                        tracing::warn!(
+                            "tool planner returned final answer for a live-state request; forcing tool call"
+                        );
+                        return with_proxy_headers(
+                            planner_decision_response(request.model.clone(), required_decision),
+                            "tool_planner_required",
+                            started.elapsed().as_millis(),
+                        );
+                    }
+                }
                 return with_proxy_headers(
                     planner_decision_response(request.model.clone(), decision),
                     "tool_planner",
@@ -231,6 +245,18 @@ async fn plan_tool_calls(
                 last_error = Some(message);
             }
         }
+    }
+
+    if let Some(decision) = planner::fallback_decision(&request, &tools) {
+        tracing::warn!(
+            error = %last_error.as_deref().unwrap_or("unknown error"),
+            "tool planner falling back to deterministic tool selection"
+        );
+        return with_proxy_headers(
+            planner_decision_response(request.model.clone(), decision),
+            "tool_planner_fallback",
+            started.elapsed().as_millis(),
+        );
     }
 
     openai::error_response(
