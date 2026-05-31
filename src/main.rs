@@ -226,13 +226,7 @@ async fn plan_tool_calls(
             }
             Err(error) => {
                 let message = error.to_string();
-                let raw_preview: String = raw.chars().take(500).collect();
-                tracing::warn!(
-                    attempt,
-                    error = %message,
-                    raw_preview = %raw_preview,
-                    "tool planner failed"
-                );
+                tracing::warn!(attempt, error = %message, "tool planner failed");
                 repair = Some(message.clone());
                 last_error = Some(message);
             }
