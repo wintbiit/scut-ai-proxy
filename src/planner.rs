@@ -122,8 +122,18 @@ pub fn parse_and_validate(
     tools: &[Tool],
     choice: &Option<ToolChoice>,
 ) -> Result<PlannerDecision, PlannerError> {
-    let decision: PlannerDecision =
-        serde_json::from_str(extract_json(raw)).map_err(PlannerError::InvalidJson)?;
+    let decision: PlannerDecision = match serde_json::from_str(extract_json(raw)) {
+        Ok(decision) => decision,
+        Err(error) => {
+            if let Some(decision) =
+                parse_xml_style_tool_call(raw, tools).or_else(|| infer_named_tool_call(raw, tools))
+            {
+                decision
+            } else {
+                return Err(PlannerError::InvalidJson(error));
+            }
+        }
+    };
     validate_decision(&decision, tools, choice)?;
     Ok(decision)
 }
@@ -226,6 +236,154 @@ fn looks_like_deferred_tool_use(content: &str, tools: &[Tool]) -> bool {
         !name.is_empty() && normalized.contains(&name)
     }) || normalized.contains("tool")
         || normalized.contains("工具")
+}
+
+fn parse_xml_style_tool_call(raw: &str, tools: &[Tool]) -> Option<PlannerDecision> {
+    for tool in tools {
+        let name = &tool.function.name;
+        let open = format!("<{name}");
+        let Some(start) = raw.find(&open) else {
+            continue;
+        };
+        let after_open = &raw[start + open.len()..];
+        let Some(end) = after_open.find('>') else {
+            continue;
+        };
+        let tag_body = after_open[..end].trim().trim_end_matches('/').trim();
+        let mut arguments = parse_xml_attrs(tag_body);
+        normalize_common_arguments(name, &mut arguments);
+        return Some(PlannerDecision::ToolCalls {
+            calls: vec![PlannerCall {
+                name: name.clone(),
+                arguments: Value::Object(arguments),
+            }],
+        });
+    }
+    None
+}
+
+fn parse_xml_attrs(input: &str) -> serde_json::Map<String, Value> {
+    let mut attrs = serde_json::Map::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let key_start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'.'))
+        {
+            i += 1;
+        }
+        if key_start == i {
+            break;
+        }
+        let key = &input[key_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let quote = bytes[i];
+        let value = if quote == b'"' || quote == b'\'' {
+            i += 1;
+            let value_start = i;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
+            }
+            let value = &input[value_start..i];
+            if i < bytes.len() {
+                i += 1;
+            }
+            value
+        } else {
+            let value_start = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            &input[value_start..i]
+        };
+        attrs.insert(key.to_string(), coerce_attr_value(value));
+    }
+    attrs
+}
+
+fn coerce_attr_value(value: &str) -> Value {
+    match value {
+        "true" => Value::Bool(true),
+        "false" => Value::Bool(false),
+        _ => value
+            .parse::<i64>()
+            .map(|number| Value::Number(number.into()))
+            .unwrap_or_else(|_| Value::String(value.to_string())),
+    }
+}
+
+fn normalize_common_arguments(tool_name: &str, arguments: &mut serde_json::Map<String, Value>) {
+    if tool_name == "resources_list" || tool_name == "resources_get" {
+        if !arguments.contains_key("apiVersion") {
+            let group = arguments
+                .remove("group")
+                .and_then(|v| v.as_str().map(ToOwned::to_owned));
+            let version = arguments
+                .remove("version")
+                .and_then(|v| v.as_str().map(ToOwned::to_owned));
+            if let Some(version) = version {
+                let api_version = match group.as_deref() {
+                    Some("") | Some("core") | None => version,
+                    Some(group) => format!("{group}/{version}"),
+                };
+                arguments.insert("apiVersion".to_string(), Value::String(api_version));
+            }
+        }
+        if !arguments.contains_key("kind") {
+            if let Some(resource) = arguments
+                .remove("resource")
+                .and_then(|v| v.as_str().map(ToOwned::to_owned))
+            {
+                let kind = match resource.as_str() {
+                    "deployments" | "deployment" => "Deployment",
+                    "services" | "service" => "Service",
+                    "pods" | "pod" => "Pod",
+                    "ingresses" | "ingress" => "Ingress",
+                    "statefulsets" | "statefulset" => "StatefulSet",
+                    "daemonsets" | "daemonset" => "DaemonSet",
+                    other => other,
+                };
+                arguments.insert("kind".to_string(), Value::String(kind.to_string()));
+            }
+        }
+        arguments.remove("all_namespaces");
+    }
+}
+
+fn infer_named_tool_call(raw: &str, tools: &[Tool]) -> Option<PlannerDecision> {
+    let normalized = raw.to_lowercase();
+    if !looks_like_deferred_tool_use(raw, tools) {
+        return None;
+    }
+    tools.iter().find_map(|tool| {
+        let name = tool.function.name.to_lowercase();
+        if !name.is_empty() && normalized.contains(&name) {
+            Some(PlannerDecision::ToolCalls {
+                calls: vec![PlannerCall {
+                    name: tool.function.name.clone(),
+                    arguments: Value::Object(serde_json::Map::new()),
+                }],
+            })
+        } else {
+            None
+        }
+    })
 }
 
 fn validate_arguments(tool: &Tool, arguments: &Value) -> Result<(), PlannerError> {
@@ -375,5 +533,60 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(decision, PlannerDecision::Final { .. }));
+    }
+
+    #[test]
+    fn parses_xml_style_tool_call() {
+        let tools = vec![Tool {
+            kind: "function".to_string(),
+            function: crate::openai::ToolFunction {
+                name: "resources_list".to_string(),
+                description: None,
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "apiVersion": {"type": "string"},
+                        "kind": {"type": "string"}
+                    },
+                    "required": ["apiVersion", "kind"]
+                }),
+            },
+        }];
+        let decision = parse_and_validate(
+            r#"<resources_list group="apps" version="v1" resource="deployments" all_namespaces="true"></resources_list>"#,
+            &tools,
+            &Some(ToolChoice::String("auto".to_string())),
+        )
+        .unwrap();
+        match decision {
+            PlannerDecision::ToolCalls { calls } => {
+                assert_eq!(calls[0].name, "resources_list");
+                assert_eq!(calls[0].arguments["apiVersion"], "apps/v1");
+                assert_eq!(calls[0].arguments["kind"], "Deployment");
+            }
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn infers_named_tool_call_from_deferred_text() {
+        let tools = vec![Tool {
+            kind: "function".to_string(),
+            function: crate::openai::ToolFunction {
+                name: "nodes_top".to_string(),
+                description: None,
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+        }];
+        let decision = parse_and_validate(
+            "结论：正在查询节点 CPU 使用情况，将调用 nodes_top 工具。",
+            &tools,
+            &Some(ToolChoice::String("auto".to_string())),
+        )
+        .unwrap();
+        assert!(matches!(decision, PlannerDecision::ToolCalls { .. }));
     }
 }
