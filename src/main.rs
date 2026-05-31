@@ -17,8 +17,9 @@ use chat3::{Chat3Client, completion_response};
 use config::Config;
 use futures_util::StreamExt;
 use openai::{
-    ChatChoice, ChatChunkChoice, ChatChunkDelta, ChatCompletionChunk, ChatCompletionRequest,
-    ChatCompletionResponse, ChatMessage,
+    ChatChoice, ChatChunkChoice, ChatChunkDelta, ChatChunkToolCall, ChatChunkToolCallFunction,
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
+    ResponseToolCall,
 };
 use serde_json::{Value, json};
 use std::time::Instant;
@@ -218,23 +219,26 @@ async fn plan_tool_calls(
         let raw = reasoning::clean_reasoning(&collected.raw_content);
         match planner::parse_and_validate(&raw, &tools, &request.tool_choice) {
             Ok(decision) => {
-                if matches!(decision, planner::PlannerDecision::Final { .. }) {
-                    if let Some(required_decision) =
+                if matches!(decision, planner::PlannerDecision::Final { .. })
+                    && let Some(required_decision) =
                         planner::required_tool_decision(&request, &tools)
-                    {
-                        tracing::warn!(
-                            "tool planner returned final answer for a live-state request; forcing tool call"
-                        );
-                        return with_proxy_headers(
-                            planner_decision_response(request.model.clone(), required_decision),
-                            "tool_planner_required",
-                            started.elapsed().as_millis(),
-                        );
-                    }
+                {
+                    tracing::warn!(
+                        "tool planner returned final answer for a live-state request; forcing tool call"
+                    );
+                    return with_proxy_headers(
+                        planner_decision_response(
+                            request.model.clone(),
+                            required_decision,
+                            request.stream,
+                        ),
+                        planner_mode("tool_planner_required", request.stream),
+                        started.elapsed().as_millis(),
+                    );
                 }
                 return with_proxy_headers(
-                    planner_decision_response(request.model.clone(), decision),
-                    "tool_planner",
+                    planner_decision_response(request.model.clone(), decision, request.stream),
+                    planner_mode("tool_planner", request.stream),
                     started.elapsed().as_millis(),
                 );
             }
@@ -253,8 +257,8 @@ async fn plan_tool_calls(
             "tool planner falling back to deterministic tool selection"
         );
         return with_proxy_headers(
-            planner_decision_response(request.model.clone(), decision),
-            "tool_planner_fallback",
+            planner_decision_response(request.model.clone(), decision, request.stream),
+            planner_mode("tool_planner_fallback", request.stream),
             started.elapsed().as_millis(),
         );
     }
@@ -270,13 +274,29 @@ async fn plan_tool_calls(
     )
 }
 
-fn planner_decision_response(model: String, decision: planner::PlannerDecision) -> Response {
+fn planner_mode(base: &'static str, stream_response: bool) -> &'static str {
+    match (base, stream_response) {
+        ("tool_planner", true) => "tool_planner_stream",
+        ("tool_planner_required", true) => "tool_planner_required_stream",
+        ("tool_planner_fallback", true) => "tool_planner_fallback_stream",
+        _ => base,
+    }
+}
+
+fn planner_decision_response(
+    model: String,
+    decision: planner::PlannerDecision,
+    stream_response: bool,
+) -> Response {
     let created = chrono::Utc::now().timestamp();
     let id = format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis());
 
     match decision {
         planner::PlannerDecision::ToolCalls { .. } => {
             let tool_calls = planner::response_tool_calls(decision).unwrap_or_default();
+            if stream_response {
+                return tool_calls_stream_response(id, created, model, tool_calls);
+            }
             Json(ChatCompletionResponse {
                 id,
                 object: "chat.completion".to_string(),
@@ -297,9 +317,50 @@ fn planner_decision_response(model: String, decision: planner::PlannerDecision) 
             .into_response()
         }
         planner::PlannerDecision::Final { content } => {
+            if stream_response {
+                return final_text_stream_response(id, created, model, content);
+            }
             Json(completion_response(model, content, id, created)).into_response()
         }
     }
+}
+
+fn tool_calls_stream_response(
+    id: String,
+    created: i64,
+    model: String,
+    tool_calls: Vec<ResponseToolCall>,
+) -> Response {
+    let events = stream! {
+        for (index, tool_call) in tool_calls.into_iter().enumerate() {
+            let chunk = tool_call_chunk_response(&id, created, &model, index as u32, tool_call);
+            yield Ok::<Event, Infallible>(Event::default().json_data(chunk).expect("tool call chunk serializes"));
+        }
+        let done = finish_chunk_response(&id, created, &model, "tool_calls");
+        yield Ok(Event::default().json_data(done).expect("finish chunk serializes"));
+        yield Ok(Event::default().data("[DONE]"));
+    };
+
+    Sse::new(events).into_response()
+}
+
+fn final_text_stream_response(
+    id: String,
+    created: i64,
+    model: String,
+    content: String,
+) -> Response {
+    let events = stream! {
+        if !content.is_empty() {
+            let chunk = content_chunk_response(&id, created, &model, content);
+            yield Ok::<Event, Infallible>(Event::default().json_data(chunk).expect("content chunk serializes"));
+        }
+        let done = finish_chunk_response(&id, created, &model, "stop");
+        yield Ok(Event::default().json_data(done).expect("finish chunk serializes"));
+        yield Ok(Event::default().data("[DONE]"));
+    };
+
+    Sse::new(events).into_response()
 }
 
 fn authorization(headers: &HeaderMap) -> Result<&str, Response> {
@@ -370,19 +431,158 @@ fn chunk_response(
     content: String,
     finish_reason: Option<String>,
 ) -> ChatCompletionChunk {
+    let id = format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis());
+    let created = chrono::Utc::now().timestamp();
+    content_chunk_with_finish_response(&id, created, model, content, finish_reason)
+}
+
+fn content_chunk_response(
+    id: &str,
+    created: i64,
+    model: &str,
+    content: String,
+) -> ChatCompletionChunk {
+    content_chunk_with_finish_response(id, created, model, content, None)
+}
+
+fn content_chunk_with_finish_response(
+    id: &str,
+    created: i64,
+    model: &str,
+    content: String,
+    finish_reason: Option<String>,
+) -> ChatCompletionChunk {
     ChatCompletionChunk {
-        id: format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis()),
+        id: id.to_string(),
         object: "chat.completion.chunk".to_string(),
-        created: chrono::Utc::now().timestamp(),
+        created,
         model: model.to_string(),
         choices: vec![ChatChunkChoice {
             index: 0,
             delta: ChatChunkDelta {
                 role: None,
                 content: Some(content),
+                tool_calls: None,
             },
             finish_reason,
         }],
+    }
+}
+
+fn tool_call_chunk_response(
+    id: &str,
+    created: i64,
+    model: &str,
+    index: u32,
+    tool_call: ResponseToolCall,
+) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk".to_string(),
+        created,
+        model: model.to_string(),
+        choices: vec![ChatChunkChoice {
+            index: 0,
+            delta: ChatChunkDelta {
+                role: Some("assistant".to_string()),
+                content: None,
+                tool_calls: Some(vec![ChatChunkToolCall {
+                    index,
+                    id: Some(tool_call.id),
+                    kind: Some(tool_call.kind),
+                    function: ChatChunkToolCallFunction {
+                        name: Some(tool_call.function.name),
+                        arguments: Some(tool_call.function.arguments),
+                    },
+                }]),
+            },
+            finish_reason: None,
+        }],
+    }
+}
+
+fn finish_chunk_response(
+    id: &str,
+    created: i64,
+    model: &str,
+    finish_reason: &str,
+) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk".to_string(),
+        created,
+        model: model.to_string(),
+        choices: vec![ChatChunkChoice {
+            index: 0,
+            delta: ChatChunkDelta {
+                role: None,
+                content: None,
+                tool_calls: None,
+            },
+            finish_reason: Some(finish_reason.to_string()),
+        }],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openai::{ResponseToolCall, ResponseToolCallFunction};
+
+    #[test]
+    fn serializes_openai_streaming_tool_call_chunk() {
+        let chunk = tool_call_chunk_response(
+            "chatcmpl-test",
+            123,
+            "test-model",
+            0,
+            ResponseToolCall {
+                id: "call_000000".to_string(),
+                kind: "function".to_string(),
+                function: ResponseToolCallFunction {
+                    name: "pods_list_in_namespace".to_string(),
+                    arguments: r#"{"namespace":"store"}"#.to_string(),
+                },
+            },
+        );
+
+        let value = serde_json::to_value(chunk).unwrap();
+
+        assert_eq!(value["object"], "chat.completion.chunk");
+        assert_eq!(
+            value["choices"][0]["finish_reason"],
+            serde_json::Value::Null
+        );
+        assert_eq!(value["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(
+            value["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "pods_list_in_namespace"
+        );
+        assert_eq!(
+            value["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            r#"{"namespace":"store"}"#
+        );
+        assert!(value["choices"][0]["delta"].get("content").is_none());
+    }
+
+    #[test]
+    fn serializes_tool_call_finish_chunk() {
+        let chunk = finish_chunk_response("chatcmpl-test", 123, "test-model", "tool_calls");
+        let value = serde_json::to_value(chunk).unwrap();
+
+        assert_eq!(value["choices"][0]["finish_reason"], "tool_calls");
+        assert!(value["choices"][0]["delta"].get("tool_calls").is_none());
+        assert!(value["choices"][0]["delta"].get("content").is_none());
+    }
+
+    #[test]
+    fn marks_streaming_planner_mode() {
+        assert_eq!(planner_mode("tool_planner", true), "tool_planner_stream");
+        assert_eq!(planner_mode("tool_planner", false), "tool_planner");
+        assert_eq!(
+            planner_mode("tool_planner_fallback", true),
+            "tool_planner_fallback_stream"
+        );
     }
 }
 
