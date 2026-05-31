@@ -117,9 +117,11 @@ impl Chat3Client {
 }
 
 fn normalize_tool_messages_for_upstream(request: &mut ChatCompletionRequest) {
+    let mut saw_tool_protocol = false;
     for message in &mut request.messages {
         match message.role.as_str() {
             "tool" => {
+                saw_tool_protocol = true;
                 let name = message
                     .name
                     .as_deref()
@@ -141,6 +143,7 @@ fn normalize_tool_messages_for_upstream(request: &mut ChatCompletionRequest) {
             }
             "assistant" => {
                 if let Some(tool_calls) = message.tool_calls.take() {
+                    saw_tool_protocol = true;
                     let existing = message
                         .content
                         .as_ref()
@@ -161,6 +164,10 @@ fn normalize_tool_messages_for_upstream(request: &mut ChatCompletionRequest) {
             }
             _ => {}
         }
+    }
+    if saw_tool_protocol {
+        request.tools = None;
+        request.tool_choice = None;
     }
 }
 
@@ -380,6 +387,8 @@ mod tests {
         assert!(content.contains("Tool result from pods_list_in_namespace"));
         assert!(content.contains("truncated tool result"));
         assert!(content.len() < MAX_TOOL_RESULT_CHARS + 300);
+        assert!(request.tools.is_none());
+        assert!(request.tool_choice.is_none());
     }
 
     #[test]

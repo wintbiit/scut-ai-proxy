@@ -53,10 +53,22 @@ pub fn should_plan(request: &ChatCompletionRequest) -> bool {
         .tools
         .as_ref()
         .is_some_and(|tools| !tools.is_empty())
+        && !has_tool_result(request)
         && !matches!(
             request.tool_choice.as_ref(),
             Some(ToolChoice::String(choice)) if choice == "none"
         )
+}
+
+fn has_tool_result(request: &ChatCompletionRequest) -> bool {
+    request.messages.iter().any(|message| {
+        message.role == "tool"
+            || message
+                .content
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.starts_with("Tool result from "))
+    })
 }
 
 pub fn planner_request(
@@ -705,6 +717,28 @@ mod tests {
             tools: Some(vec![tool_schema("x")]),
             tool_choice: Some(ToolChoice::String("none".to_string())),
         };
+        assert!(!should_plan(&req));
+    }
+
+    #[test]
+    fn does_not_plan_after_tool_result() {
+        let req = ChatCompletionRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage {
+                role: "tool".to_string(),
+                content: Some(Value::String("pod list".to_string())),
+                name: Some("pods_list_in_namespace".to_string()),
+                tool_call_id: Some("call_1".to_string()),
+                tool_calls: None,
+            }],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            tools: Some(vec![tool_schema("pods_log")]),
+            tool_choice: Some(ToolChoice::String("auto".to_string())),
+        };
+
         assert!(!should_plan(&req));
     }
 
