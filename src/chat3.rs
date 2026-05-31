@@ -8,6 +8,8 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+const MAX_TOOL_RESULT_CHARS: usize = 8_000;
+
 #[derive(Clone)]
 pub struct Chat3Client {
     http: reqwest::Client,
@@ -128,6 +130,7 @@ fn normalize_tool_messages_for_upstream(request: &mut ChatCompletionRequest) {
                     .as_ref()
                     .map(stringify_message_content)
                     .unwrap_or_default();
+                let content = truncate_for_upstream(&content, MAX_TOOL_RESULT_CHARS);
                 message.role = "user".to_string();
                 message.content = Some(Value::String(format!(
                     "Tool result from {name}:\n{content}"
@@ -166,6 +169,24 @@ fn stringify_message_content(value: &Value) -> String {
         Value::String(text) => text.clone(),
         other => other.to_string(),
     }
+}
+
+fn truncate_for_upstream(content: &str, max_chars: usize) -> String {
+    if content.chars().count() <= max_chars {
+        return content.to_string();
+    }
+
+    let cutoff = content
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(content.len());
+    format!(
+        "{}\n\n[scut-ai-proxy truncated tool result: original_chars={}, kept_chars={}]",
+        &content[..cutoff],
+        content.chars().count(),
+        max_chars
+    )
 }
 
 #[derive(Debug)]
@@ -327,6 +348,38 @@ mod tests {
                 .unwrap()
                 .contains("Tool result from query_prometheus")
         );
+    }
+
+    #[test]
+    fn truncates_large_tool_results_for_chat3() {
+        let large = "x".repeat(MAX_TOOL_RESULT_CHARS + 100);
+        let mut request = ChatCompletionRequest {
+            model: "chat3".to_string(),
+            messages: vec![ChatMessage {
+                role: "tool".to_string(),
+                content: Some(Value::String(large)),
+                name: Some("pods_list_in_namespace".to_string()),
+                tool_call_id: Some("call_1".to_string()),
+                tool_calls: None,
+            }],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        normalize_tool_messages_for_upstream(&mut request);
+
+        let content = request.messages[0]
+            .content
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(content.contains("Tool result from pods_list_in_namespace"));
+        assert!(content.contains("truncated tool result"));
+        assert!(content.len() < MAX_TOOL_RESULT_CHARS + 300);
     }
 
     #[test]
