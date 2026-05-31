@@ -42,6 +42,10 @@ pub enum PlannerError {
     RequiredToolCall,
     #[error("tool_choice requires tool {0}")]
     SpecificToolRequired(String),
+    #[error(
+        "planner returned a final answer that promises tool use instead of returning tool_calls"
+    )]
+    PrematureFinal,
 }
 
 pub fn should_plan(request: &ChatCompletionRequest) -> bool {
@@ -105,6 +109,10 @@ If no tool is needed, return:
 {{"type":"final","content":"your final answer"}}
 
 Use only tool names from the available tools. Arguments must be a JSON object.
+For tool_choice "auto", call a tool whenever the user asks to check, inspect, query,
+search, list, diagnose, troubleshoot, verify current state, or use external/live
+information. Do not answer that you will call a tool later; return tool_calls now.
+Return "final" only when the user's request can be fully answered without any tool.
 {repair_note}"#
     )
 }
@@ -156,6 +164,12 @@ fn validate_decision(
         _ => {}
     }
 
+    if let PlannerDecision::Final { content } = decision {
+        if looks_like_deferred_tool_use(content, tools) {
+            return Err(PlannerError::PrematureFinal);
+        }
+    }
+
     if let PlannerDecision::ToolCalls { calls } = decision {
         for call in calls {
             let Some(tool) = map.get(&call.name) else {
@@ -165,6 +179,53 @@ fn validate_decision(
         }
     }
     Ok(())
+}
+
+fn looks_like_deferred_tool_use(content: &str, tools: &[Tool]) -> bool {
+    let normalized = content.to_lowercase();
+    let deferred_markers = [
+        "i will call",
+        "i'll call",
+        "i will use",
+        "i'll use",
+        "i will query",
+        "i'll query",
+        "i will check",
+        "i'll check",
+        "need to call",
+        "need to use",
+        "need to query",
+        "calling tool",
+        "call tool",
+        "use tool",
+        "query tool",
+        "tool:",
+        "tool：",
+        "调用工具",
+        "调用 ",
+        "使用工具",
+        "查询工具",
+        "我将",
+        "我会",
+        "需要先",
+        "请稍等",
+        "正在查询",
+        "将查询",
+        "先查询",
+    ];
+
+    let promises_tool = deferred_markers
+        .iter()
+        .any(|marker| normalized.contains(marker));
+    if !promises_tool {
+        return false;
+    }
+
+    tools.iter().any(|tool| {
+        let name = tool.function.name.to_lowercase();
+        !name.is_empty() && normalized.contains(&name)
+    }) || normalized.contains("tool")
+        || normalized.contains("工具")
 }
 
 fn validate_arguments(tool: &Tool, arguments: &Value) -> Result<(), PlannerError> {
@@ -290,5 +351,29 @@ mod tests {
             tool_choice: Some(ToolChoice::String("none".to_string())),
         };
         assert!(!should_plan(&req));
+    }
+
+    #[test]
+    fn rejects_final_answer_that_defers_tool_call() {
+        let tools = vec![tool_schema("nodes_top")];
+        let err = parse_and_validate(
+            r#"{"type":"final","content":"请稍等，我将调用工具 nodes_top 获取节点 CPU 信息。"}"#,
+            &tools,
+            &Some(ToolChoice::String("auto".to_string())),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlannerError::PrematureFinal));
+    }
+
+    #[test]
+    fn allows_final_answer_without_tool_promise() {
+        let tools = vec![tool_schema("nodes_top")];
+        let decision = parse_and_validate(
+            r#"{"type":"final","content":"你好，我可以帮助你分析集群状态。"}"#,
+            &tools,
+            &Some(ToolChoice::String("auto".to_string())),
+        )
+        .unwrap();
+        assert!(matches!(decision, PlannerDecision::Final { .. }));
     }
 }
