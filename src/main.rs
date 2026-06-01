@@ -462,8 +462,10 @@ fn final_text_stream_response(
 ) -> Response {
     let events = stream! {
         if !content.is_empty() {
-            let chunk = content_chunk_response(&id, created, &model, content);
-            yield Ok::<Event, Infallible>(Event::default().json_data(chunk).expect("content chunk serializes"));
+            for piece in split_stream_content(&content, 64) {
+                let chunk = content_chunk_response(&id, created, &model, piece);
+                yield Ok::<Event, Infallible>(Event::default().json_data(chunk).expect("content chunk serializes"));
+            }
         }
         let done = finish_chunk_response(&id, created, &model, "stop");
         yield Ok(Event::default().json_data(done).expect("finish chunk serializes"));
@@ -471,6 +473,25 @@ fn final_text_stream_response(
     };
 
     Sse::new(events).into_response()
+}
+
+fn split_stream_content(content: &str, max_chars: usize) -> Vec<String> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for ch in content.chars() {
+        current.push(ch);
+        if current.chars().count() >= max_chars {
+            chunks.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 fn authorization(headers: &HeaderMap) -> Result<&str, Response> {
@@ -693,6 +714,12 @@ mod tests {
             planner_mode("tool_planner_fallback", true),
             "tool_planner_fallback_stream"
         );
+    }
+
+    #[test]
+    fn splits_stream_content_on_char_boundary() {
+        let chunks = split_stream_content("一二三四五", 2);
+        assert_eq!(chunks, vec!["一二", "三四", "五"]);
     }
 }
 
