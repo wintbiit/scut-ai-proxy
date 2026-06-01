@@ -265,6 +265,17 @@ async fn plan_tool_calls(
         );
     }
 
+    if planner::tool_result_count(&request) > 0 {
+        tracing::warn!(
+            error = %last_error.as_deref().unwrap_or("unknown error"),
+            "tool planner failed after tool results; falling back to final chat response"
+        );
+        if request.stream {
+            return stream_chat(state, auth.to_string(), request).await;
+        }
+        return collect_chat(state, auth, request).await;
+    }
+
     openai::error_response(
         StatusCode::BAD_GATEWAY,
         "upstream_error",
