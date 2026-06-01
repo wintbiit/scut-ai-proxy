@@ -227,10 +227,7 @@ async fn plan_tool_calls(
                     tracing::info!(
                         "tool planner requested pod metrics without a resource-usage query; generating final chat response"
                     );
-                    if request.stream {
-                        return stream_chat(state, auth.to_string(), request).await;
-                    }
-                    return collect_chat(state, auth, request).await;
+                    return final_chat_after_tools(state, auth, request).await;
                 }
                 if matches!(decision, planner::PlannerDecision::Final { .. })
                     && planner::tool_result_count(&request) > 0
@@ -238,10 +235,7 @@ async fn plan_tool_calls(
                     tracing::info!(
                         "tool planner determined no more tools are needed; generating final chat response"
                     );
-                    if request.stream {
-                        return stream_chat(state, auth.to_string(), request).await;
-                    }
-                    return collect_chat(state, auth, request).await;
+                    return final_chat_after_tools(state, auth, request).await;
                 }
                 if matches!(decision, planner::PlannerDecision::Final { .. })
                     && let Some(required_decision) =
@@ -292,10 +286,7 @@ async fn plan_tool_calls(
             error = %last_error.as_deref().unwrap_or("unknown error"),
             "tool planner failed after tool results; falling back to final chat response"
         );
-        if request.stream {
-            return stream_chat(state, auth.to_string(), request).await;
-        }
-        return collect_chat(state, auth, request).await;
+        return final_chat_after_tools(state, auth, request).await;
     }
 
     openai::error_response(
@@ -307,6 +298,47 @@ async fn plan_tool_calls(
         ),
         Some("tool_planner_failed".to_string()),
     )
+}
+
+async fn final_chat_after_tools(
+    state: Arc<AppState>,
+    auth: &str,
+    request: ChatCompletionRequest,
+) -> Response {
+    let stream_response = request.stream;
+    let requested_model = request.model.clone();
+    let started = Instant::now();
+    match state.chat3.chat_collect(auth, request).await {
+        Ok(collected) => {
+            let content = reasoning::clean_reasoning(&collected.raw_content);
+            let model = if collected.model.is_empty() {
+                requested_model
+            } else {
+                collected.model
+            };
+            let id = if collected.id.is_empty() {
+                format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis())
+            } else {
+                collected.id
+            };
+            let created = if collected.created == 0 {
+                chrono::Utc::now().timestamp()
+            } else {
+                collected.created
+            };
+            let response = if stream_response {
+                final_text_stream_response(id, created, model, content)
+            } else {
+                Json(completion_response(model, content, id, created)).into_response()
+            };
+            with_proxy_headers(
+                response,
+                planner_mode("tool_planner_final_chat", stream_response),
+                started.elapsed().as_millis(),
+            )
+        }
+        Err(error) => upstream_error(error),
+    }
 }
 
 fn is_unrequested_pod_metrics_call(
