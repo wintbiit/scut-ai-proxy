@@ -221,6 +221,17 @@ async fn plan_tool_calls(
         let raw = reasoning::clean_reasoning(&collected.raw_content);
         match planner::parse_and_validate(&raw, &tools, &request.tool_choice) {
             Ok(decision) => {
+                if planner::tool_result_count(&request) > 0
+                    && is_unrequested_pod_metrics_call(&request, &decision)
+                {
+                    tracing::info!(
+                        "tool planner requested pod metrics without a resource-usage query; generating final chat response"
+                    );
+                    if request.stream {
+                        return stream_chat(state, auth.to_string(), request).await;
+                    }
+                    return collect_chat(state, auth, request).await;
+                }
                 if matches!(decision, planner::PlannerDecision::Final { .. })
                     && planner::tool_result_count(&request) > 0
                 {
@@ -296,6 +307,49 @@ async fn plan_tool_calls(
         ),
         Some("tool_planner_failed".to_string()),
     )
+}
+
+fn is_unrequested_pod_metrics_call(
+    request: &ChatCompletionRequest,
+    decision: &planner::PlannerDecision,
+) -> bool {
+    if user_asked_for_resource_usage(request) {
+        return false;
+    }
+    matches!(
+        decision,
+        planner::PlannerDecision::ToolCalls { calls }
+            if calls.iter().any(|call| call.name == "pods_top")
+    )
+}
+
+fn user_asked_for_resource_usage(request: &ChatCompletionRequest) -> bool {
+    let Some(text) = request.messages.iter().rev().find_map(|message| {
+        if message.role != "user" {
+            return None;
+        }
+        let content = message.content.as_ref()?;
+        match content {
+            Value::String(text) => Some(text.to_lowercase()),
+            other => Some(other.to_string().to_lowercase()),
+        }
+    }) else {
+        return false;
+    };
+
+    [
+        "cpu",
+        "memory",
+        "top",
+        "内存",
+        "资源",
+        "占用",
+        "负载",
+        "用量",
+        "使用率",
+    ]
+    .iter()
+    .any(|keyword| text.contains(keyword))
 }
 
 fn planner_mode(base: &'static str, stream_response: bool) -> &'static str {
