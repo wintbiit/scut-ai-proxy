@@ -53,22 +53,25 @@ pub fn should_plan(request: &ChatCompletionRequest) -> bool {
         .tools
         .as_ref()
         .is_some_and(|tools| !tools.is_empty())
-        && !has_tool_result(request)
         && !matches!(
             request.tool_choice.as_ref(),
             Some(ToolChoice::String(choice)) if choice == "none"
         )
 }
 
-fn has_tool_result(request: &ChatCompletionRequest) -> bool {
-    request.messages.iter().any(|message| {
-        message.role == "tool"
-            || message
-                .content
-                .as_ref()
-                .and_then(Value::as_str)
-                .is_some_and(|content| content.starts_with("Tool result from "))
-    })
+pub fn tool_result_count(request: &ChatCompletionRequest) -> usize {
+    request
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == "tool"
+                || message
+                    .content
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.starts_with("Tool result from "))
+        })
+        .count()
 }
 
 pub fn planner_request(
@@ -125,6 +128,10 @@ For tool_choice "auto", call a tool whenever the user asks to check, inspect, qu
 search, list, diagnose, troubleshoot, verify current state, or use external/live
 information. Do not answer that you will call a tool later; return tool_calls now.
 Return "final" only when the user's request can be fully answered without any tool.
+If previous tool results are already present, use them to decide the next best tool
+call. Return "final" only when the current evidence is sufficient; otherwise call
+another relevant tool with narrower arguments instead of guessing from incomplete
+or truncated results.
 {repair_note}"#
     )
 }
@@ -721,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn does_not_plan_after_tool_result() {
+    fn plans_after_tool_result() {
         let req = ChatCompletionRequest {
             model: "m".to_string(),
             messages: vec![ChatMessage {
@@ -739,7 +746,8 @@ mod tests {
             tool_choice: Some(ToolChoice::String("auto".to_string())),
         };
 
-        assert!(!should_plan(&req));
+        assert!(should_plan(&req));
+        assert_eq!(tool_result_count(&req), 1);
     }
 
     #[test]

@@ -98,7 +98,9 @@ async fn chat_completions(
         Err(response) => return response,
     };
 
-    if planner::should_plan(&request) {
+    if planner::should_plan(&request)
+        && planner::tool_result_count(&request) < state.config.planner_max_tool_rounds
+    {
         return plan_tool_calls(state, &auth, request).await;
     }
 

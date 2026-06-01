@@ -6,6 +6,7 @@ pub struct Config {
     pub chat3_base_url: String,
     pub request_timeout: Duration,
     pub planner_repair_attempts: usize,
+    pub planner_max_tool_rounds: usize,
 }
 
 impl Config {
@@ -23,12 +24,17 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(1);
+        let planner_max_tool_rounds = env::var("PLANNER_MAX_TOOL_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(6);
 
         Self {
             bind_addr,
             chat3_base_url,
             request_timeout: Duration::from_secs(request_timeout_secs),
             planner_repair_attempts,
+            planner_max_tool_rounds,
         }
     }
 }
