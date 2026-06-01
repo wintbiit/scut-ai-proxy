@@ -8,7 +8,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-const MAX_TOOL_RESULT_CHARS: usize = 8_000;
+const MAX_TOOL_RESULT_CHARS: usize = 16_000;
 
 #[derive(Clone)]
 pub struct Chat3Client {
@@ -183,16 +183,27 @@ fn truncate_for_upstream(content: &str, max_chars: usize) -> String {
         return content.to_string();
     }
 
-    let cutoff = content
+    let total_chars = content.chars().count();
+    let head_chars = max_chars / 2;
+    let tail_chars = max_chars - head_chars;
+    let head_cutoff = content
         .char_indices()
-        .nth(max_chars)
+        .nth(head_chars)
         .map(|(idx, _)| idx)
         .unwrap_or(content.len());
+    let tail_start = content
+        .char_indices()
+        .nth(total_chars.saturating_sub(tail_chars))
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+
     format!(
-        "{}\n\n[scut-ai-proxy truncated tool result: original_chars={}, kept_chars={}]",
-        &content[..cutoff],
-        content.chars().count(),
-        max_chars
+        "{}\n\n[scut-ai-proxy truncated middle of tool result: original_chars={}, kept_head_chars={}, kept_tail_chars={}]\n\n{}",
+        &content[..head_cutoff],
+        total_chars,
+        head_chars,
+        tail_chars,
+        &content[tail_start..],
     )
 }
 
@@ -359,7 +370,12 @@ mod tests {
 
     #[test]
     fn truncates_large_tool_results_for_chat3() {
-        let large = "x".repeat(MAX_TOOL_RESULT_CHARS + 100);
+        let large = format!(
+            "{}{}{}",
+            "head-marker\n",
+            "x".repeat(MAX_TOOL_RESULT_CHARS + 100),
+            "\ntail-marker"
+        );
         let mut request = ChatCompletionRequest {
             model: "chat3".to_string(),
             messages: vec![ChatMessage {
@@ -385,8 +401,10 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap();
         assert!(content.contains("Tool result from pods_list_in_namespace"));
-        assert!(content.contains("truncated tool result"));
-        assert!(content.len() < MAX_TOOL_RESULT_CHARS + 300);
+        assert!(content.contains("truncated middle of tool result"));
+        assert!(content.contains("head-marker"));
+        assert!(content.contains("tail-marker"));
+        assert!(content.len() < MAX_TOOL_RESULT_CHARS + 400);
         assert!(request.tools.is_none());
         assert!(request.tool_choice.is_none());
     }
