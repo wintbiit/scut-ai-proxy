@@ -222,6 +222,17 @@ async fn plan_tool_calls(
         match planner::parse_and_validate(&raw, &tools, &request.tool_choice) {
             Ok(decision) => {
                 if matches!(decision, planner::PlannerDecision::Final { .. })
+                    && planner::tool_result_count(&request) > 0
+                {
+                    tracing::info!(
+                        "tool planner determined no more tools are needed; generating final chat response"
+                    );
+                    if request.stream {
+                        return stream_chat(state, auth.to_string(), request).await;
+                    }
+                    return collect_chat(state, auth, request).await;
+                }
+                if matches!(decision, planner::PlannerDecision::Final { .. })
                     && let Some(required_decision) =
                         planner::required_tool_decision(&request, &tools)
                 {
